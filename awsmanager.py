@@ -1,7 +1,10 @@
+from http.client import responses
+
 import boto3
 import logging
 import os
 import json
+import datetime
 
 with open("AWS.log", 'w') as f:
     pass
@@ -33,7 +36,8 @@ class EC2Manager:
         try:
             self.logging.info(f"Trying to start instance {instance_id}.")
             instance_status = \
-            self.ec2.describe_instances(InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]["State"]["Name"]
+                self.ec2.describe_instances(InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]["State"][
+                    "Name"]
             if instance_status == "Stopped":
                 self.ec2.start_instances(InstanceIds=[instance_id])
                 self.logging.info(f"Instance {instance_id} started.")
@@ -48,22 +52,43 @@ class EC2Manager:
         self.logging.info(json.dumps(response, indent=2, default=str))
 
     def create_instance(self, ami, instance_type, key_name, security_group_ids, subnet_id):
+        response = {}
         try:
-            self.logging.info("Trying to create instance.")
-            self.ec2.run_instances(
+            self.logging.info("Trying to create instances.")
+            response = self.ec2.run_instances(
                 ImageId=ami,
                 InstanceType=instance_type,
                 SubnetId=subnet_id,
                 KeyName=key_name,
                 SecurityGroupIds=security_group_ids,
-                MinCount=1,
-                MaxCount=1
+                MinCount=3,
+                MaxCount=3,
             )
+            self.logging.info("Instances created successfully.")
         except Exception as e:
             self.logging.critical(f"Unable to create instance.")
+            self.logging.info(f"error: {e}")
+        try:
+            self.logging.info("Trying to tag instances.")
+            instances_ids = [i["InstanceId"] for i in response["Instances"]]
+            for idx, instance_id in enumerate(instances_ids, start=1):
+                self.ec2.create_tags(
+                    Resources=[instance_id],
+                    Tags=[
+                        {"Key": "Name", "Value": f"{os.getlogin()}-{idx}"},
+                        {"Key": "Creation_Date", "Value": datetime.datetime.now().strftime('%Y-%m-%d')},
+                        {"Key": "Creation_Time", "Value": datetime.datetime.now().strftime('%H:%M:%S')},
+                        {"Key": "TTL", "Value": 3},
+                        {"Key": "Owner", "Value": os.getlogin()}
+                    ]
+                )
+            self.logging.info("Tags created successfully.")
+        except Exception as e:
+            self.logging.critical(f"Unable to tag instance.")
             self.logging.info(f"error: {e}")
 
 
 if __name__ == "__main__":
     aws = AWSManager("il-central-1")
-    aws.ec2.create_instance('ami-04dbb447f35f57d09', "t3.micro", "ILCPC", ["sg-0447697ffab839be8"], "subnet-0a7e88d01e6e83164")
+    aws.ec2.create_instance('ami-04dbb447f35f57d09', "t3.micro", "Liel", ["sg-0b2d91c761e623f65"],
+                            "subnet-09a20cbde1d2c0c16")
