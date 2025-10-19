@@ -1,4 +1,3 @@
-from time import sleep
 from datetime import datetime, timedelta
 from xmlrpc.client import Boolean
 
@@ -6,9 +5,7 @@ import boto3
 import logging
 import os
 import subprocess
-import json
 import argparse
-
 
 with open("AWS.log", 'w') as f:
     pass
@@ -30,6 +27,7 @@ class AWSManager:
         )
         self.ec2 = EC2Manager(self.session)
         self.dynamo = DynamoBD(self.session)
+        self.s3 = S3(self.session)
 
 
 class EC2Manager:
@@ -92,13 +90,19 @@ class EC2Manager:
             self.logging.info(f"error: {e}")
 
     def check_ttl(self):
-        response = {}
         for_delete_list = []
         now = datetime.now()
         try:
             self.logging.info("Check all instances TTL.")
-            response = self.ec2.describe_instances()["Reservations"][0]["Instances"]
-            for instance in response:
+            response = self.ec2.describe_instances(
+                Filters=[
+                    {
+                        'Name': 'instance-state-name',
+                        'Values': ['running']
+                    },
+                ]
+            )
+            for instance in response["Reservations"][0]["Instances"]:
                 instance_id = instance["InstanceId"]
                 tags = {t['Key']: t['Value'] for t in instance.get('Tags', [])}
                 if not tags:
@@ -115,11 +119,30 @@ class EC2Manager:
                     for_delete_list.append(instance_id)
                     self.logging.info(
                         f"Instance {instance_id} TTL has expired at {expired_at} - adding to delete list.")
-            self.logging.info(f"For delete list: {for_delete_list}")
-            aws.dynamo.update_delete_list(for_delete_list)
+            if for_delete_list:
+                self.logging.info(f"New instances added to list 'for delete list', list: {for_delete_list}")
+                current_list = aws.dynamo.get_for_delete_list()
+                updated_list = list(set(for_delete_list + current_list))
+                aws.dynamo.update_delete_list(updated_list)
+            else:
+                self.logging.info("No instances added to list 'for delete list' - The list is empty.")
 
         except Exception as e:
             self.logging.info("Unable to check instances TTL.")
+            self.logging.info(f"error: {e}")
+
+    def terminate_instance(self):
+        try:
+            self.logging.info(f"Delete expired instances")
+            for_delete_list = aws.dynamo.get_for_delete_list()
+            if for_delete_list:
+                self.ec2.terminate_instances(InstanceIds=for_delete_list)
+                self.logging.info(f"Instances {for_delete_list} terminated.")
+                aws.dynamo.update_delete_list([])
+            else:
+                self.logging.info(f"There is no expired instance in the list")
+        except Exception as e:
+            self.logging.critical(f"Unable to terminate instances")
             self.logging.info(f"error: {e}")
 
 
@@ -128,34 +151,52 @@ class DynamoBD:
         self.dynamo = session.resource('dynamodb')
         self.logging = logging.getLogger("DynamoBD")
 
-    def update_delete_list(self, for_delete_list):
+    def get_for_delete_list(self, ):
         try:
-            self.logging.info("Update delete list.")
+            self.logging.info("Get 'for delete list' from DynamoDB.")
             table = self.dynamo.Table('For_Delete')
-            current_list = table.get_item(Key={'delete_list': "instances_list"})['Item']['Ids']
-            print(f"current_list: {current_list}")
-            updated_list = list(set(for_delete_list + current_list))
+            current_list = table.get_item(Key={'delete_list': "instances_list"})['Item']['ids']
+            self.logging.info(f"Current list: {current_list}")
+            return current_list
+        except Exception as e:
+            self.logging.critical(f"Unable to get 'for delete list'")
+            self.logging.info(f"error: {e}")
+
+    def update_delete_list(self, updated_list):
+        try:
+            self.logging.info(f"Updating 'for delete list' with new list: {updated_list}")
+            table = self.dynamo.Table('For_Delete')
 
             table.put_item(
-                Key={"delete_list": "instances_list"},
-                UpdateExpression="SET Ids = list_append(if_not_exists(Ids, :empty_list), :updated_list)",
-                ExpressionAttributeValues={
-                    ":updated_list": updated_list,
-                    ":empty_list": []
+                Item={
+                    'delete_list': "instances_list",
+                    'ids': updated_list
                 }
             )
-
-            current_list = table.get_item(Key={'delete_list': "instances_list"})['Item']['Ids']
-            print(f"current_list: {current_list}")
-            self.logging.info("Update list succeeded.")
-
+            current_list = table.get_item(Key={'delete_list': "instances_list"})['Item']['ids']
+            self.logging.info(f"Updated list: {current_list}")
+            self.logging.info("Update 'for delete list' succeeded.")
         except Exception as e:
             self.logging.critical(f"Unable to update delete list.")
             self.logging.info(f"error: {e}")
 
 
+class S3:
+    def __init__(self, session):
+        self.s3 = session.client('s3')
+        self.logging = logging.getLogger("S3")
+
+    def upload_file(self, file_name, bucket, key):
+        try:
+            self.logging.info(f"Uploading {file_name} to {bucket}/{key}.")
+            self.s3.upload_file(file_name, bucket, key)
+        except Exception as e:
+            self.logging.critical(f"Unable to upload file to S3.")
+            self.logging.info(f"error: {e}")
+
+
 if __name__ == "__main__":
-    usage_msg = "\npython awsmanager.py --region <REGION> --count <NUMBER> --ttl <TIME_TO_LIVE>\n"
+    usage_msg = "\npython awsmanager.py --createInstances <True | False > --deleteExpired <True | False > --region <REGION> --count <NUMBER> --ttl <TIME_TO_LIVE>\n"
     parser = argparse.ArgumentParser(usage=usage_msg)
     parser.add_argument("--createInstances", help="Create Instances", type=Boolean, default=False)
     parser.add_argument("--deleteExpired", help="Delete expired instances", type=Boolean, default=False)
@@ -176,3 +217,6 @@ if __name__ == "__main__":
                                 "subnet-09a20cbde1d2c0c16")
     if deleteExpired:
         aws.ec2.check_ttl()
+        aws.ec2.terminate_instance()
+
+    aws.s3.upload_file('AWS.log', 'aws-manager-logs', 'logs/aws-manager.log')
