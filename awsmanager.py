@@ -1,10 +1,14 @@
-from http.client import responses
+from time import sleep
+from datetime import datetime, timedelta
+from xmlrpc.client import Boolean
 
 import boto3
 import logging
 import os
+import subprocess
 import json
-import datetime
+import argparse
+
 
 with open("AWS.log", 'w') as f:
     pass
@@ -25,6 +29,7 @@ class AWSManager:
             # aws_session_token=os.environ.get('AWS_SESSION_TOKEN'),
         )
         self.ec2 = EC2Manager(self.session)
+        self.dynamo = DynamoBD(self.session)
 
 
 class EC2Manager:
@@ -47,11 +52,7 @@ class EC2Manager:
             self.logging.critical(f"Unable to start instance {instance_id}.")
             self.logging.info(f"error: {e}")
 
-    def describe_instances(self, instance_id):
-        response = self.ec2.describe_instances(InstanceIds=[instance_id])
-        self.logging.info(json.dumps(response, indent=2, default=str))
-
-    def create_instance(self, ami, instance_type, key_name, security_group_ids, subnet_id):
+    def create_instance(self, count, ami, instance_type, key_name, security_group_ids, subnet_id):
         response = {}
         try:
             self.logging.info("Trying to create instances.")
@@ -61,8 +62,8 @@ class EC2Manager:
                 SubnetId=subnet_id,
                 KeyName=key_name,
                 SecurityGroupIds=security_group_ids,
-                MinCount=3,
-                MaxCount=3,
+                MinCount=count,
+                MaxCount=count,
             )
             self.logging.info("Instances created successfully.")
         except Exception as e:
@@ -70,25 +71,108 @@ class EC2Manager:
             self.logging.info(f"error: {e}")
         try:
             self.logging.info("Trying to tag instances.")
+            username = subprocess.run(["powershell", "-Command", "[Environment]::UserName"], capture_output=True,
+                                      text=True,
+                                      check=True).stdout.strip()
             instances_ids = [i["InstanceId"] for i in response["Instances"]]
             for idx, instance_id in enumerate(instances_ids, start=1):
                 self.ec2.create_tags(
                     Resources=[instance_id],
                     Tags=[
                         {"Key": "Name", "Value": f"{os.getlogin()}-{idx}"},
-                        {"Key": "Creation_Date", "Value": datetime.datetime.now().strftime('%Y-%m-%d')},
-                        {"Key": "Creation_Time", "Value": datetime.datetime.now().strftime('%H:%M:%S')},
-                        {"Key": "TTL", "Value": 3},
-                        {"Key": "Owner", "Value": os.getlogin()}
+                        {"Key": "Creation_Date", "Value": datetime.now().strftime('%d-%m-%Y')},
+                        {"Key": "Creation_Time", "Value": datetime.now().strftime('%H:%M:%S')},
+                        {"Key": "TTL", "Value": "3"},
+                        {"Key": "Owner", "Value": username}
                     ]
                 )
             self.logging.info("Tags created successfully.")
         except Exception as e:
-            self.logging.critical(f"Unable to tag instance.")
+            self.logging.critical(f"Unable to tag instance")
+            self.logging.info(f"error: {e}")
+
+    def check_ttl(self):
+        response = {}
+        for_delete_list = []
+        now = datetime.now()
+        try:
+            self.logging.info("Check all instances TTL.")
+            response = self.ec2.describe_instances()["Reservations"][0]["Instances"]
+            for instance in response:
+                instance_id = instance["InstanceId"]
+                tags = {t['Key']: t['Value'] for t in instance.get('Tags', [])}
+                if not tags:
+                    for_delete_list.append(instance_id)
+                    self.logging.critical(f"Found instance without any tags - {instance_id} - adding to delete list.")
+
+                creation_date = tags.get('Creation_Date')
+                creation_time = tags.get('Creation_Time')
+                ttl = int(tags.get('TTL'))
+
+                created = datetime.strptime(f"{creation_date} {creation_time}", '%d-%m-%Y %H:%M:%S')
+                expired_at = created + timedelta(minutes=ttl)
+                if now > expired_at:
+                    for_delete_list.append(instance_id)
+                    self.logging.info(
+                        f"Instance {instance_id} TTL has expired at {expired_at} - adding to delete list.")
+            self.logging.info(f"For delete list: {for_delete_list}")
+            aws.dynamo.update_delete_list(for_delete_list)
+
+        except Exception as e:
+            self.logging.info("Unable to check instances TTL.")
+            self.logging.info(f"error: {e}")
+
+
+class DynamoBD:
+    def __init__(self, session):
+        self.dynamo = session.resource('dynamodb')
+        self.logging = logging.getLogger("DynamoBD")
+
+    def update_delete_list(self, for_delete_list):
+        try:
+            self.logging.info("Update delete list.")
+            table = self.dynamo.Table('For_Delete')
+            current_list = table.get_item(Key={'delete_list': "instances_list"})['Item']['Ids']
+            print(f"current_list: {current_list}")
+            updated_list = list(set(for_delete_list + current_list))
+
+            table.put_item(
+                Key={"delete_list": "instances_list"},
+                UpdateExpression="SET Ids = list_append(if_not_exists(Ids, :empty_list), :updated_list)",
+                ExpressionAttributeValues={
+                    ":updated_list": updated_list,
+                    ":empty_list": []
+                }
+            )
+
+            current_list = table.get_item(Key={'delete_list': "instances_list"})['Item']['Ids']
+            print(f"current_list: {current_list}")
+            self.logging.info("Update list succeeded.")
+
+        except Exception as e:
+            self.logging.critical(f"Unable to update delete list.")
             self.logging.info(f"error: {e}")
 
 
 if __name__ == "__main__":
-    aws = AWSManager("il-central-1")
-    aws.ec2.create_instance('ami-04dbb447f35f57d09', "t3.micro", "Liel", ["sg-0b2d91c761e623f65"],
-                            "subnet-09a20cbde1d2c0c16")
+    usage_msg = "\npython awsmanager.py --region <REGION> --count <NUMBER> --ttl <TIME_TO_LIVE>\n"
+    parser = argparse.ArgumentParser(usage=usage_msg)
+    parser.add_argument("--createInstances", help="Create Instances", type=Boolean, default=False)
+    parser.add_argument("--deleteExpired", help="Delete expired instances", type=Boolean, default=False)
+    parser.add_argument("--region", help="AWS region", default="il-central-1", required=False)
+    parser.add_argument("--count", help="Instances Number", default="3", required=False, type=int)
+    parser.add_argument("--ttl", help="Time To Live", default="3", required=False, type=int)
+
+    args = parser.parse_args()
+    create_instances = args.createInstances
+    deleteExpired = args.deleteExpired
+    region = args.region
+    count = args.count
+    ttl = args.ttl
+
+    aws = AWSManager(region)
+    if create_instances:
+        aws.ec2.create_instance(count, 'ami-04dbb447f35f57d09', "t3.micro", "Liel", ["sg-0b2d91c761e623f65"],
+                                "subnet-09a20cbde1d2c0c16")
+    if deleteExpired:
+        aws.ec2.check_ttl()
